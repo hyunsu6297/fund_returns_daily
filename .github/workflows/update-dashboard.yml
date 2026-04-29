@@ -1,0 +1,99 @@
+name: Update fund return dashboard
+
+on:
+  schedule:
+    # 07:30 KST, Monday-Friday. GitHub schedules use UTC.
+    - cron: "30 22 * * 0-4"
+  workflow_dispatch:
+    inputs:
+      download_raw:
+        description: "Download 펀드 기준가.xlsx before rebuilding"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+  push:
+    branches:
+      - main
+    paths:
+      - "build_fund_dashboard.py"
+      - "download_fund_price.py"
+      - "mapping.xlsx"
+      - "Hana_EMP.xlsx"
+      - "펀드 기준가.xlsx"
+      - "plotly-2.35.2.min.js"
+      - ".github/workflows/update-dashboard.yml"
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: fund-return-dashboard
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Ensure Plotly is available
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from urllib.request import urlretrieve
+
+          target = Path("plotly-2.35.2.min.js")
+          if not target.exists():
+              urlretrieve("https://cdn.plot.ly/plotly-2.35.2.min.js", target)
+          PY
+
+      - name: Download raw fund price data
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.download_raw == 'true')
+        env:
+          KFROM_ID: ${{ secrets.KFROM_ID }}
+          KFROM_PASSWORD: ${{ secrets.KFROM_PASSWORD }}
+        run: python download_fund_price.py
+
+      - name: Build dashboard
+        run: python build_fund_dashboard.py
+
+      - name: Commit updated dashboard files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "펀드 기준가.xlsx" "docs/index.html" "fund_return_chart("*.html "plotly-2.35.2.min.js"
+          git diff --cached --quiet || git commit -m "Update fund return dashboard"
+          git push
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
