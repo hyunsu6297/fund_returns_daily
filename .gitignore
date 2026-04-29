@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+~$*.xlsx
+kfroms_debug.*
+펀드 기준가_backup_*.xlsx
+__download_*
