@@ -89,6 +89,33 @@ jobs:
       - name: Build dashboard
         run: python build_fund_dashboard.py
 
+      - name: Patch dashboard HTML behavior
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          files = [Path("docs/index.html"), *Path(".").glob("fund_return_chart(*).html")]
+          helper = "function allDataDates(){return [...new Set(Object.values(DATA.series).flatMap(rows=>rows.map(row=>row[0])))].filter(Boolean).sort()}function firstDataDateOnOrAfter(target,end){return allDataDates().find(date=>date>=target&&date<=end)||target}"
+          replacements = {
+              "$('ytd').onclick=()=>{let y=$('end').value.slice(0,4);$('start').value=Math.max(DATA.dateMin,`${y}-01-01`);render()};":
+                  helper + "$('ytd').onclick=()=>{let y=$('end').value.slice(0,4),raw=`${y}-01-01`,target=raw<DATA.dateMin?DATA.dateMin:raw;$('start').value=firstDataDateOnOrAfter(target,$('end').value);render()};",
+              "$('mtd').onclick=()=>{$('start').value=$('end').value.slice(0,8)+'01';render()};":
+                  "$('mtd').onclick=()=>{let raw=$('end').value.slice(0,8)+'01',target=raw<DATA.dateMin?DATA.dateMin:raw;$('start').value=firstDataDateOnOrAfter(target,$('end').value);render()};",
+              "<td>${pct(m.tr.ytd)}</td><td>${pct(m.tr.mtd)}</td><td>${pct(m.tr.d1)}</td><td>${pct(m.tr.w1)}</td><td>${pct(m.tr.m1)}</td><td>${pct(m.tr.m3)}</td><td>${pct(m.tr.m6)}</td><td>${pct(m.tr.y1)}</td>":
+                  "<td class=\"${cls(m.tr.ytd)}\">${pct(m.tr.ytd)}</td><td class=\"${cls(m.tr.mtd)}\">${pct(m.tr.mtd)}</td><td class=\"${cls(m.tr.d1)}\">${pct(m.tr.d1)}</td><td class=\"${cls(m.tr.w1)}\">${pct(m.tr.w1)}</td><td class=\"${cls(m.tr.m1)}\">${pct(m.tr.m1)}</td><td class=\"${cls(m.tr.m3)}\">${pct(m.tr.m3)}</td><td class=\"${cls(m.tr.m6)}\">${pct(m.tr.m6)}</td><td class=\"${cls(m.tr.y1)}\">${pct(m.tr.y1)}</td>",
+          }
+
+          for path in files:
+              if not path.exists():
+                  continue
+              html = path.read_text(encoding="utf-8")
+              original = html
+              for old, new in replacements.items():
+                  html = html.replace(old, new)
+              if html != original:
+                  path.write_text(html, encoding="utf-8")
+          PY
+
       - name: Commit updated dashboard files
         run: |
           git config user.name "github-actions[bot]"
