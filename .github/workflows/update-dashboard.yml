@@ -58,15 +58,7 @@ jobs:
           python -m playwright install --with-deps chromium
 
       - name: Ensure Plotly is available
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          from urllib.request import urlretrieve
-
-          target = Path("plotly-2.35.2.min.js")
-          if not target.exists():
-              urlretrieve("https://cdn.plot.ly/plotly-2.35.2.min.js", target)
-          PY
+        run: python -c "from pathlib import Path; from urllib.request import urlretrieve; p=Path('plotly-2.35.2.min.js'); (not p.exists()) and urlretrieve('https://cdn.plot.ly/plotly-2.35.2.min.js', p)"
 
       - name: Download raw fund price data
         if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.download_raw == 'true')
@@ -82,7 +74,8 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "펀드 기준가.xlsx" "docs/index.html" "fund_return_chart("*.html "plotly-2.35.2.min.js"
+          git add "펀드 기준가.xlsx" "docs/index.html" "plotly-2.35.2.min.js" || true
+          git add fund_return_chart\(*.html || true
           git diff --cached --quiet || git commit -m "Update fund return dashboard"
           git push
 
