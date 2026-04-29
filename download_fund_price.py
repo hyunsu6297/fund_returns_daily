@@ -104,6 +104,70 @@ def is_text_visible(page, text: str) -> bool:
     return visible_text_box(page, text) is not None
 
 
+def click_excel_download_menu(page, timeout: int = 8000) -> None:
+    targets = ["엑셀다운로드", "엑셀 다운로드", "Excel 다운로드", "Excel Export", "Export to Excel", "엑셀"]
+    for text in targets:
+        try:
+            click_text(page, text, timeout=1200)
+            return
+        except Exception:
+            continue
+
+    deadline = datetime.now().timestamp() + timeout / 1000
+    while datetime.now().timestamp() < deadline:
+        box = page.evaluate(
+            """
+            (targets) => {
+                const normalize = (value) => (value || '').replace(/\s+/g, '').toLowerCase();
+                const wanted = targets.map(normalize);
+                const nodes = Array.from(document.querySelectorAll('body *'));
+                const candidates = [];
+
+                for (const node of nodes) {
+                    const normalizedText = normalize(node.textContent);
+                    if (!normalizedText || !wanted.some((text) => normalizedText.includes(text))) {
+                        continue;
+                    }
+
+                    const style = window.getComputedStyle(node);
+                    const rect = node.getBoundingClientRect();
+                    if (
+                        style.visibility === 'hidden' ||
+                        style.display === 'none' ||
+                        rect.width === 0 ||
+                        rect.height === 0
+                    ) {
+                        continue;
+                    }
+
+                    candidates.push({
+                        x: rect.x,
+                        y: rect.y,
+                        width: rect.width,
+                        height: rect.height,
+                        area: rect.width * rect.height,
+                    });
+                }
+
+                if (!candidates.length) return null;
+                candidates.sort((a, b) => a.area - b.area);
+                const rect = candidates[0];
+                return {
+                    x: rect.x + rect.width / 2,
+                    y: rect.y + rect.height / 2,
+                };
+            }
+            """,
+            targets,
+        )
+        if box:
+            page.mouse.click(box["x"], box["y"])
+            return
+        page.wait_for_timeout(200)
+
+    raise RuntimeError("우클릭 메뉴에서 엑셀다운로드 항목을 찾지 못했습니다.")
+
+
 def click_visible_text(page, text: str, right_offset: float = 0, timeout: int = 8000) -> None:
     deadline = datetime.now().timestamp() + timeout / 1000
     box = visible_text_box(page, text)
@@ -235,7 +299,7 @@ def results_table_box(page, timeout: int = 20000):
                 const nodes = Array.from(document.querySelectorAll('body *'));
                 for (const header of headers) {
                     const node = nodes.find((candidate) => {
-                        const text = (candidate.textContent || '').replace(/\\s+/g, '').trim();
+                        const text = (candidate.textContent || '').replace(/\s+/g, '').trim();
                         return text === header && visibleRect(candidate);
                     });
                     if (!node) continue;
@@ -299,17 +363,13 @@ def open_context_menu_excel_download(page, download_dir: Path) -> Path:
     page.wait_for_timeout(500)
 
     with page.expect_download(timeout=30000) as download_info:
-        for text in ["엑셀다운로드", "엑셀 다운로드", "Excel 다운로드", "Excel Export", "Export to Excel", "엑셀"]:
-            try:
-                click_text(page, text, timeout=2500)
-                break
-            except Exception:
-                continue
-        else:
+        try:
+            click_excel_download_menu(page)
+        except Exception:
             DEBUG_TEXT.write_text(page.locator("body").inner_text(timeout=5000), encoding="utf-8")
             DEBUG_HTML.write_text(page.content(), encoding="utf-8")
             page.screenshot(path=DEBUG_SCREENSHOT, full_page=True)
-            raise RuntimeError("우클릭 메뉴에서 엑셀 다운로드 항목을 찾지 못했습니다.")
+            raise
 
     download = download_info.value
     suggested_name = download.suggested_filename or DOWNLOAD_NAME
