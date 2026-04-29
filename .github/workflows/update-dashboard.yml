@@ -21,6 +21,7 @@ on:
       - "build_fund_dashboard.py"
       - "download_fund_price.py"
       - "mapping.xlsx"
+      - "mapping.csv"
       - "Hana_EMP.xlsx"
       - "펀드 기준가.xlsx"
       - "plotly-2.35.2.min.js"
@@ -66,6 +67,24 @@ jobs:
           KFROM_ID: ${{ secrets.KFROM_ID }}
           KFROM_PASSWORD: ${{ secrets.KFROM_PASSWORD }}
         run: python download_fund_price.py
+
+      - name: Restore mapping workbook from CSV
+        run: |
+          python - <<'PY'
+          import csv
+          from pathlib import Path
+          import openpyxl
+
+          source = Path("mapping.csv")
+          if source.exists():
+              workbook = openpyxl.Workbook()
+              sheet = workbook.active
+              sheet.title = "Data"
+              with source.open("r", encoding="utf-8-sig", newline="") as file:
+                  for row in csv.reader(file):
+                      sheet.append(row)
+              workbook.save("mapping.xlsx")
+          PY
 
       - name: Build dashboard
         run: python build_fund_dashboard.py
