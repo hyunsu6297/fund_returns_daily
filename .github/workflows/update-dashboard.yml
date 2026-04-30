@@ -78,64 +78,61 @@ jobs:
             rm -f "mapping.csv"
           fi
 
-      - name: Patch dashboard presentation tweaks
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          path = Path("build_fund_dashboard.py")
-          text = path.read_text(encoding="utf-8")
-
-          replacements = {
-              ".team-actions{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px;margin:8px 0 10px}": ".team-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;margin:8px 0 10px}",
-              ".team-btn{width:100%;min-width:0;height:28px;padding:0 3px;color:#334155;font-size:10px;": ".team-btn{width:100%;min-width:0;height:28px;padding:0 4px;color:#334155;font-size:11px;",
-              ".side-title{margin:0 0 8px;font-size:14px}": ".side-title,.control-title{margin:0 0 8px;font-size:14px;color:var(--accent);font-weight:800}",
-              "    .control-title {{\n      margin: 0;\n      color: #314052;\n      font-size: 14px;\n      font-weight: 800;\n    }}": "    .control-title, .side-title {{\n      margin: 0;\n      color: var(--accent);\n      font-size: 14px;\n      font-weight: 800;\n    }}",
-              "<p class=\"control-title\">BM ?좏깮</p>": "<p class=\"control-title\">BM 선택</p>",
-              "<p class=\"control-title\">????좏깮</p>": "<p class=\"control-title\">유형/운용사별 선택</p>",
-              "<button type=\"button\" id=\"ytdBtn\">?곗큹</button>": "<button type=\"button\" id=\"ytdBtn\">연초 이후</button>",
-              "<button type=\"button\" id=\"mtdBtn\">?붿큹</button>": "<button type=\"button\" id=\"mtdBtn\">월초 이후</button>",
-              "<span>?쒖옉??/span>": "<span>시작일</span>",
-              "<span>醫낅즺??/span>": "<span>종료일</span>",
-          }
-          for old, new in replacements.items():
-              text = text.replace(old, new)
-
-          if "팀별 선택" not in text:
-              bs = "\\"
-              target = f'<div id={bs}"teamButtons{bs}" class={bs}"team-actions{bs}"></div>'
-              heading = f'<p class={bs}"side-title{bs}" style={bs}"margin-top: 12px;{bs}">팀별 선택</p>'
-              if target in text:
-                  text = text.replace(target, heading + target, 1)
-              else:
-                  target = '<div id="teamButtons" class="team-actions"></div>'
-                  text = text.replace(target, '<p class="side-title" style="margin-top: 12px;">팀별 선택</p>' + target, 1)
-          text = text.replace("<h3 class=\"side-title\" style=\"margin-top: 12px;\">팀별 선택</h3>", "<p class=\"side-title\" style=\"margin-top: 12px;\">팀별 선택</p>")
-          text = text.replace("<h3 class=\"side-title\">펀드 선택</h3>", "<h3 class=\"side-title\">유형/운용사별 선택</h3>")
-
-          reset_button = '<button type=\"button\" id=\"resetBtn\">기간 전체</button>'
-          if reset_button not in text:
-              text = text.replace('<button type=\"button\" id=\"mtdBtn\">월초 이후</button>', '<button type=\"button\" id=\"mtdBtn\">월초 이후</button>\n                ' + reset_button)
-              text = text.replace('<button type=\"button\" id=\"resetBtn\">湲곌컙 ?꾩껜</button>', '')
-          text = text.replace('<span class="quick-buttons">\n                \n              </span>', '')
-
-          if 'raw_type != "채권형(ETF)"' not in text:
-              old = 'if base_date and code and not info:\n            current = unmapped.get(code)'
-              if old in text:
-                  text = text.replace(old, 'if base_date and code and not info:\n            raw_type = str(row[2]).strip() if row[2] is not None else ""\n            if raw_type != "채권형(ETF)":\n                current = unmapped.get(code)')
-                  text = text.replace('                    "type": str(row[2]).strip() if row[2] is not None else "",', '                    "type": raw_type,')
-                  text = text.replace('            unmapped[code]["count"] += 1\n\n        if not base_date or not info:', '                unmapped[code]["count"] += 1\n\n        if not base_date or not info:')
-
-          path.write_text(text, encoding="utf-8")
-          PY
-
       - name: Build dashboard
         run: python build_fund_dashboard.py
+
+      - name: Normalize generated dashboard HTML
+        run: |
+          python - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          paths = [Path("docs/index.html"), *Path(".").glob("fund_return_chart(*.html")]
+          for path in paths:
+              if not path.exists():
+                  continue
+              html = path.read_text(encoding="utf-8")
+
+              marker = "const DATA="
+              if marker in html:
+                  start = html.index(marker) + len(marker)
+                  end = html.index(";", start)
+                  data = json.loads(html[start:end])
+                  data["unmappedFunds"] = [item for item in data.get("unmappedFunds", []) if item.get("type") != "채권형(ETF)"]
+                  html = html[:start] + json.dumps(data, ensure_ascii=False, separators=(",", ":")) + html[end:]
+
+              style_fix = ".control-title,.side-title{color:#0f766e!important;font-size:14px!important;font-weight:800!important}"
+              if style_fix not in html:
+                  html = html.replace("</style>", style_fix + "</style>", 1)
+
+              html = html.replace(">펀드 선택<", ">유형/운용사별 선택<")
+              html = html.replace(">연초<", ">연초 이후<")
+              html = html.replace(">월초<", ">월초 이후<")
+              html = html.replace(">????좏깮<", ">유형/운용사별 선택<")
+              html = html.replace(">?곗큹<", ">연초 이후<")
+              html = html.replace(">?붿큹<", ">월초 이후<")
+
+              html = re.sub(r'<h3 class=\\+"side-title\\+" style=\\+"margin-top:12px\\+">팀별 선택</h3>', '<p class="side-title" style="margin-top:12px">팀별 선택</p>', html)
+              html = re.sub(r'<h3 class="side-title" style="margin-top:\s*12px;?">팀별 선택</h3>', '<p class="side-title" style="margin-top:12px">팀별 선택</p>', html)
+              if "팀별 선택" not in html and 'id="teamButtons"' in html:
+                  html = html.replace('<div id="teamButtons" class="team-actions"></div>', '<p class="side-title" style="margin-top:12px">팀별 선택</p><div id="teamButtons" class="team-actions"></div>', 1)
+
+              # Move the full-period button from end date to the start-date quick button group.
+              all_period = re.search(r'<button[^>]*id="allPeriod"[^>]*>기간 전체</button>', html)
+              if all_period and html.find('id="allPeriod"') > html.find('id="mtd"'):
+                  button_html = all_period.group(0)
+                  html = html[:all_period.start()] + html[all_period.end():]
+                  html = re.sub(r'(<button[^>]*id="mtd"[^>]*>월초 이후</button>)', r'\1' + button_html, html, count=1)
+
+              path.write_text(html, encoding="utf-8")
+          PY
 
       - name: Commit updated dashboard files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "펀드 기준가.xlsx" "docs/index.html" "plotly-2.35.2.min.js" "build_fund_dashboard.py" || true
+          git add "펀드 기준가.xlsx" "docs/index.html" "plotly-2.35.2.min.js" || true
           git add fund_return_chart\(*.html || true
           git diff --cached --quiet || git commit -m "Update fund return dashboard"
           git push
