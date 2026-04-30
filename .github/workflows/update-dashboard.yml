@@ -78,31 +78,53 @@ jobs:
             rm -f "mapping.csv"
           fi
 
-      - name: Patch team filter layout
+      - name: Patch dashboard presentation tweaks
         run: |
           python - <<'PY'
           from pathlib import Path
           path = Path("build_fund_dashboard.py")
           text = path.read_text(encoding="utf-8")
-          text = text.replace(
-              ".team-actions{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px;margin:8px 0 10px}",
-              ".team-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;margin:8px 0 10px}",
-          )
-          text = text.replace(
-              ".team-btn{width:100%;min-width:0;height:28px;padding:0 3px;color:#334155;font-size:10px;",
-              ".team-btn{width:100%;min-width:0;height:28px;padding:0 4px;color:#334155;font-size:11px;",
-          )
+
+          replacements = {
+              ".team-actions{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px;margin:8px 0 10px}": ".team-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;margin:8px 0 10px}",
+              ".team-btn{width:100%;min-width:0;height:28px;padding:0 3px;color:#334155;font-size:10px;": ".team-btn{width:100%;min-width:0;height:28px;padding:0 4px;color:#334155;font-size:11px;",
+              ".side-title{margin:0 0 8px;font-size:14px}": ".side-title,.control-title{margin:0 0 8px;font-size:14px;color:var(--accent);font-weight:800}",
+              "    .control-title {{\n      margin: 0;\n      color: #314052;\n      font-size: 14px;\n      font-weight: 800;\n    }}": "    .control-title, .side-title {{\n      margin: 0;\n      color: var(--accent);\n      font-size: 14px;\n      font-weight: 800;\n    }}",
+              "<p class=\"control-title\">BM ?좏깮</p>": "<p class=\"control-title\">BM 선택</p>",
+              "<p class=\"control-title\">????좏깮</p>": "<p class=\"control-title\">유형/운용사별 선택</p>",
+              "<button type=\"button\" id=\"ytdBtn\">?곗큹</button>": "<button type=\"button\" id=\"ytdBtn\">연초 이후</button>",
+              "<button type=\"button\" id=\"mtdBtn\">?붿큹</button>": "<button type=\"button\" id=\"mtdBtn\">월초 이후</button>",
+              "<span>?쒖옉??/span>": "<span>시작일</span>",
+              "<span>醫낅즺??/span>": "<span>종료일</span>",
+          }
+          for old, new in replacements.items():
+              text = text.replace(old, new)
+
           if "팀별 선택" not in text:
               bs = "\\"
-              targets = [
-                  f'<div id={bs}"teamButtons{bs}" class={bs}"team-actions{bs}"></div>',
-                  '<div id="teamButtons" class="team-actions"></div>',
-              ]
-              heading = f'<h3 class={bs}"side-title{bs}" style={bs}"margin-top:12px{bs}">팀별 선택</h3>'
-              for target in targets:
-                  if target in text:
-                      text = text.replace(target, heading + target, 1)
-                      break
+              target = f'<div id={bs}"teamButtons{bs}" class={bs}"team-actions{bs}"></div>'
+              heading = f'<p class={bs}"side-title{bs}" style={bs}"margin-top: 12px;{bs}">팀별 선택</p>'
+              if target in text:
+                  text = text.replace(target, heading + target, 1)
+              else:
+                  target = '<div id="teamButtons" class="team-actions"></div>'
+                  text = text.replace(target, '<p class="side-title" style="margin-top: 12px;">팀별 선택</p>' + target, 1)
+          text = text.replace("<h3 class=\"side-title\" style=\"margin-top: 12px;\">팀별 선택</h3>", "<p class=\"side-title\" style=\"margin-top: 12px;\">팀별 선택</p>")
+          text = text.replace("<h3 class=\"side-title\">펀드 선택</h3>", "<h3 class=\"side-title\">유형/운용사별 선택</h3>")
+
+          reset_button = '<button type=\"button\" id=\"resetBtn\">기간 전체</button>'
+          if reset_button not in text:
+              text = text.replace('<button type=\"button\" id=\"mtdBtn\">월초 이후</button>', '<button type=\"button\" id=\"mtdBtn\">월초 이후</button>\n                ' + reset_button)
+              text = text.replace('<button type=\"button\" id=\"resetBtn\">湲곌컙 ?꾩껜</button>', '')
+          text = text.replace('<span class="quick-buttons">\n                \n              </span>', '')
+
+          if 'raw_type != "채권형(ETF)"' not in text:
+              old = 'if base_date and code and not info:\n            current = unmapped.get(code)'
+              if old in text:
+                  text = text.replace(old, 'if base_date and code and not info:\n            raw_type = str(row[2]).strip() if row[2] is not None else ""\n            if raw_type != "채권형(ETF)":\n                current = unmapped.get(code)')
+                  text = text.replace('                    "type": str(row[2]).strip() if row[2] is not None else "",', '                    "type": raw_type,')
+                  text = text.replace('            unmapped[code]["count"] += 1\n\n        if not base_date or not info:', '                unmapped[code]["count"] += 1\n\n        if not base_date or not info:')
+
           path.write_text(text, encoding="utf-8")
           PY
 
