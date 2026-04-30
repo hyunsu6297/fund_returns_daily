@@ -21,6 +21,7 @@ on:
     paths:
       - "build_fund_dashboard.py"
       - "download_fund_price.py"
+      - "postprocess_dashboard.py"
       - "mapping.xlsx"
       - "mapping.csv"
       - "Hana_EMP.xlsx"
@@ -80,6 +81,9 @@ jobs:
 
       - name: Build dashboard
         run: python build_fund_dashboard.py
+
+      - name: Apply dashboard presentation tweaks
+        run: python postprocess_dashboard.py
 
       - name: Commit updated dashboard files
         run: |
