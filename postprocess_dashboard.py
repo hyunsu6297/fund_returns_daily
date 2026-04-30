@@ -21,8 +21,6 @@ def replace_data_payload(html):
 
 
 def normalize_ui(html):
-    html = html.replace('\\"', '"')
-
     style = (
         ".control-title,.side-title{"
         "color:#0f766e!important;"
@@ -39,6 +37,10 @@ def normalize_ui(html):
 
     team_box = '<div id="teamButtons" class="team-actions"></div>'
     team_title = '<p class="side-title" style="margin-top:12px">팀별 선택</p>'
+    html = html.replace(
+        '<h3 class=\\"side-title\\" style=\\"margin-top:12px\\">팀별 선택</h3>',
+        team_title,
+    )
     html = re.sub(
         r'<h3 class="side-title" style="margin-top:\s*12px;?">팀별 선택</h3>',
         team_title,
