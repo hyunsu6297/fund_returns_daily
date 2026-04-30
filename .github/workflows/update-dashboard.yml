@@ -93,10 +93,16 @@ jobs:
               ".team-btn{width:100%;min-width:0;height:28px;padding:0 4px;color:#334155;font-size:11px;",
           )
           if "팀별 선택" not in text:
-              text = text.replace(
-                  '<div id=\\"teamButtons\\" class=\\"team-actions\\"></div><h3 class=\\"side-title\\">펀드 선택</h3>',
-                  '<h3 class=\\"side-title\\" style=\\"margin-top:12px\\">팀별 선택</h3><div id=\\"teamButtons\\" class=\\"team-actions\\"></div><h3 class=\\"side-title\\">펀드 선택</h3>',
-              )
+              bs = "\\"
+              targets = [
+                  f'<div id={bs}"teamButtons{bs}" class={bs}"team-actions{bs}"></div>',
+                  '<div id="teamButtons" class="team-actions"></div>',
+              ]
+              heading = f'<h3 class={bs}"side-title{bs}" style={bs}"margin-top:12px{bs}">팀별 선택</h3>'
+              for target in targets:
+                  if target in text:
+                      text = text.replace(target, heading + target, 1)
+                      break
           path.write_text(text, encoding="utf-8")
           PY
 
