@@ -71,7 +71,7 @@ jobs:
         env:
           KFROM_ID: ${{ secrets.KFROM_ID }}
           KFROM_PASSWORD: ${{ secrets.KFROM_PASSWORD }}
-        run: python download_fund_price.py
+        run: python download_fund_price.py --start-date 2025-01-02
 
       - name: Prefer mapping workbook
         run: |
