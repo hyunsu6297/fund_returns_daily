@@ -91,7 +91,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add "펀드 기준가.xlsx" "docs/index.html" "plotly-2.35.2.min.js" || true
-          git add fund_return_chart\(*.html || true
+          git add daily_html/fund_return_chart\(*.html || true
           git diff --cached --quiet || git commit -m "Update fund return dashboard"
           git push
 

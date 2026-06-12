@@ -14,7 +14,8 @@ MAPPING_CSV = BASE_DIR / "mapping.csv"
 HANA_EMP = BASE_DIR / "Hana_EMP.xlsx"
 PLOTLY_JS = BASE_DIR / "plotly-2.35.2.min.js"
 KST = ZoneInfo("Asia/Seoul")
-OUTPUT = BASE_DIR / f"fund_return_chart({datetime.now(KST):%y%m%d}).html"
+DAILY_HTML_DIR = BASE_DIR / "daily_html"
+OUTPUT = DAILY_HTML_DIR / f"fund_return_chart({datetime.now(KST):%y%m%d}).html"
 WEB_OUTPUT = BASE_DIR / "docs" / "index.html"
 
 
@@ -282,6 +283,7 @@ init();startAutoRefreshCheck();
 
 if __name__ == "__main__":
     html = build_html(build_payload())
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT.write_text(html, encoding="utf-8")
     WEB_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     WEB_OUTPUT.write_text(html, encoding="utf-8")

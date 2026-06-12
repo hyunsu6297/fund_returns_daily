@@ -68,7 +68,7 @@ def normalize_ui(html):
 
 
 def main():
-    targets = [Path("docs/index.html"), *Path(".").glob("fund_return_chart(*.html")]
+    targets = [Path("docs/index.html"), *Path("daily_html").glob("fund_return_chart(*.html")]
     for path in targets:
         if not path.exists():
             continue
