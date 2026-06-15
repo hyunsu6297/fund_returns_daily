@@ -9,6 +9,8 @@ import openpyxl
 
 BASE_DIR = Path(__file__).resolve().parent
 SOURCE = BASE_DIR / "펀드 기준가.xlsx"
+BM_WORKBOOK = BASE_DIR / "bm.xlsx"
+BM_DEFINITION = BASE_DIR / "bm_definition_template.xlsx"
 MAPPING = BASE_DIR / "mapping.xlsx"
 MAPPING_CSV = BASE_DIR / "mapping.csv"
 HANA_EMP = BASE_DIR / "Hana_EMP.xlsx"
@@ -111,13 +113,156 @@ def append_hana_emp(mapping, funds, series, all_dates):
             all_dates.append(base_date)
 
 
+def load_bm_sheet(workbook, sheet_name, header_row):
+    sheet = workbook[sheet_name]
+    headers = [str(value).strip() if value is not None else "" for value in next(sheet.iter_rows(min_row=header_row, max_row=header_row, values_only=True))]
+    dates = []
+    values = {}
+    for row in sheet.iter_rows(min_row=header_row + 1, values_only=True):
+        base_date = as_date_text(row[0] if row else None)
+        if not base_date:
+            continue
+        dates.append(base_date)
+        values[base_date] = {
+            headers[idx]: as_number(value)
+            for idx, value in enumerate(row)
+            if idx < len(headers) and headers[idx] and idx > 0
+        }
+    return dates, values
+
+
+def load_bm_sources():
+    if not BM_WORKBOOK.exists():
+        return [], {}
+    workbook = openpyxl.load_workbook(BM_WORKBOOK, read_only=True, data_only=True)
+    bb_dates, bb_values = load_bm_sheet(workbook, "bb", 4)
+    _, if_values = load_bm_sheet(workbook, "if", 3)
+    calendar = sorted(dict.fromkeys(bb_dates))
+    return calendar, {"bb": bb_values, "if": if_values}
+
+
+def load_bm_definitions():
+    if not BM_DEFINITION.exists():
+        return []
+    workbook = openpyxl.load_workbook(BM_DEFINITION, read_only=True, data_only=True)
+    sheet = workbook["bm_def"] if "bm_def" in workbook.sheetnames else workbook.active
+    rows = list(sheet.iter_rows(min_row=1, values_only=True))
+    if not rows:
+        return []
+    headers = [str(value).strip() if value is not None else "" for value in rows[0]]
+    pos = {header: idx for idx, header in enumerate(headers)}
+
+    def value(row, name, default=""):
+        idx = pos.get(name)
+        return row[idx] if idx is not None and idx < len(row) and row[idx] is not None else default
+
+    groups = OrderedDict()
+    for row in rows[2:]:
+        bm_id = str(value(row, "BM_ID")).strip()
+        if not bm_id or str(value(row, "UseYN", "Y")).strip().upper() != "Y":
+            continue
+        weight = as_number(value(row, "Weight", 0)) or 0
+        spread = as_number(value(row, "Spread", 0)) or 0
+        day_count = as_number(value(row, "DayCount", 365)) or 365
+        item = groups.setdefault(bm_id, {
+            "id": bm_id,
+            "name": str(value(row, "BM_Name", bm_id)).strip() or bm_id,
+            "sortOrder": as_number(value(row, "SortOrder", 9999)) or 9999,
+            "category": str(value(row, "Category", "BM")).strip() or "BM",
+            "description": str(value(row, "Description", "")).strip(),
+            "components": [],
+        })
+        if not item["description"] and value(row, "Description", ""):
+            item["description"] = str(value(row, "Description", "")).strip()
+        item["components"].append({
+            "sourceSheet": str(value(row, "SourceSheet", "bb")).strip().lower(),
+            "component": str(value(row, "Component")).strip(),
+            "calcType": str(value(row, "CalcType", "PRICE")).strip().upper(),
+            "weight": weight / 100,
+            "spread": spread,
+            "dayCount": day_count,
+        })
+    return sorted(groups.values(), key=lambda item: (item["sortOrder"], item["name"]))
+
+
+def component_daily_return(component, sources, current_date, previous_date):
+    sheet_values = sources.get(component["sourceSheet"], {})
+    current = sheet_values.get(current_date, {}).get(component["component"])
+    if current is None:
+        return None
+    if previous_date is None:
+        return 0
+    if component["calcType"] == "RATE":
+        elapsed_days = max((datetime.strptime(current_date, "%Y-%m-%d") - datetime.strptime(previous_date, "%Y-%m-%d")).days, 0)
+        annual_rate = (current + component["spread"]) / 100
+        return annual_rate * elapsed_days / component["dayCount"]
+    previous = sheet_values.get(previous_date, {}).get(component["component"])
+    if previous in (None, 0):
+        return None
+    return current / previous - 1
+
+
+def build_bm_series():
+    calendar, sources = load_bm_sources()
+    definitions = load_bm_definitions()
+    bms = []
+    series = {}
+    for bm in definitions:
+        rows = []
+        level = 1000
+        previous_date = None
+        for base_date in calendar:
+            component_returns = []
+            missing = False
+            for component in bm["components"]:
+                daily_return = component_daily_return(component, sources, base_date, previous_date)
+                if daily_return is None:
+                    missing = True
+                    break
+                component_returns.append(daily_return * component["weight"])
+            if missing:
+                previous_date = base_date
+                continue
+            weighted_return = sum(component_returns)
+            previous_level = level if rows else None
+            if rows:
+                level *= 1 + weighted_return
+            cumulative = level / 1000 - 1
+            rows.append([
+                base_date,
+                round(weighted_return * 100, 6),
+                round(level, 6),
+                round(previous_level, 6) if previous_level is not None else None,
+                0,
+                round(cumulative * 100, 6),
+                round(level, 6),
+            ])
+            previous_date = base_date
+        bms.append({
+            "id": bm["id"],
+            "name": bm["name"],
+            "code": bm["id"],
+            "type": "BM",
+            "manager": "BM",
+            "team": "BM",
+            "category": bm["category"],
+            "description": bm["description"],
+            "investDate": "",
+            "returnMode": "compound",
+            "isBm": True,
+            "count": len(rows),
+            "sortOrder": bm["sortOrder"],
+        })
+        series[bm["id"]] = rows
+    return bms, series
+
+
 def build_payload():
     mapping = load_mapping()
     workbook = openpyxl.load_workbook(SOURCE, read_only=True, data_only=True)
     sheet = workbook["Data"] if "Data" in workbook.sheetnames else workbook.active
     funds = OrderedDict()
     series = {}
-    bm_levels = OrderedDict()
     all_dates = []
     unmapped = {}
 
@@ -125,13 +270,6 @@ def build_payload():
         base_date = as_date_text(row[1])
         if not base_date:
             continue
-        if base_date not in bm_levels:
-            bm_levels[base_date] = {
-                "BM_KOSPI": as_number(row[11]),
-                "BM_KOSDAQ": as_number(row[12]),
-                "BM_SPX": as_number(row[13]),
-                "BM_NASDAQ": as_number(row[14]),
-            }
         code = str(row[3]).strip() if row[3] is not None else ""
         info = mapping.get(code)
         if code and not info:
@@ -172,23 +310,8 @@ def build_payload():
         sorted_series[str(new_id)] = sorted(series[str(old_id)], key=lambda item: item[0])
         fund_rows[new_id] = fund
 
-    bm_names = {"BM_KOSPI": "KOSPI", "BM_KOSDAQ": "KOSDAQ", "BM_SPX": "S&P500", "BM_NASDAQ": "NASDAQ"}
-    bms = []
-    for code, name in bm_names.items():
-        rows = []
-        first = prev = None
-        for base_date, levels in sorted(bm_levels.items()):
-            level = levels.get(code)
-            if level is None:
-                continue
-            if first is None:
-                first = level
-            daily = 0 if prev is None else (level / prev - 1) * 100
-            cum = (level / first - 1) * 100
-            rows.append([base_date, round(daily, 6), round(level, 6), round(prev, 6) if prev is not None else None, 0, round(cum, 6), round(level, 6)])
-            prev = level
-        bms.append({"id": code, "name": name, "code": code, "type": "BM", "manager": "BM", "team": "BM", "investDate": "", "returnMode": "compound", "isBm": True, "count": len(rows)})
-        sorted_series[code] = rows
+    bms, bm_series = build_bm_series()
+    sorted_series.update(bm_series)
 
     if not all_dates:
         all_dates = [date for rows in sorted_series.values() for date, *_ in rows]
@@ -220,19 +343,20 @@ def build_html(payload):
 <title>펀드 일별 수익률 대시보드</title>
 <style>
 :root{--ink:#17212b;--muted:#657385;--line:#d9e0e7;--panel:#fff;--wash:#f5f7fa;--accent:#0f766e;--good:#047857;--bad:#dc2626}*{box-sizing:border-box}body{margin:0;font-family:"Segoe UI","Malgun Gothic",Arial,sans-serif;color:var(--ink);background:var(--wash)}header{padding:26px 32px 18px;background:#fff;border-bottom:1px solid var(--line)}h1{margin:0 0 8px;font-size:26px}.source{color:var(--muted);font-size:13px;line-height:1.45}main{padding:22px 32px 32px}.shell{display:grid;grid-template-columns:320px minmax(0,1fr);gap:18px;align-items:start}.main{display:grid;gap:18px;min-width:0}.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px}.sidebar{position:sticky;top:14px;max-height:calc(100vh - 28px);overflow:hidden;padding:14px}.side-title{margin:0 0 8px;font-size:14px}.bm-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;padding-bottom:10px;border-bottom:1px solid var(--line)}.bm-grid label{display:grid;grid-template-columns:18px 1fr;gap:6px;align-items:center;padding:7px 8px;border:1px solid #d8e0e8;border-radius:6px;background:#fff;font-size:13px;font-weight:700}.reset-all-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0 12px}.reset-all-row button{grid-column:1/-1}.team-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;margin:8px 0 10px}.team-btn{width:100%;min-width:0;height:28px;padding:0 4px;color:#334155;font-size:11px;font-weight:750;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.team-btn.active{color:#fff;background:var(--accent);border-color:var(--accent)}.filter-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}.filter{position:relative}.filter button,.action-row button,.period button,.chart-actions button,.table-actions button,.reset-all-row button,.team-btn,.legend-clear{border:1px solid #c8d1dc;border-radius:6px;background:#fff;color:var(--ink);font-weight:700;cursor:pointer}.filter>button{width:100%;height:38px;display:flex;justify-content:space-between;align-items:center;padding:0 10px}.filter>button:after{content:"▾";font-size:11px;color:var(--muted)}.menu{display:none;position:absolute;left:0;right:0;top:42px;z-index:20;max-height:420px;overflow:auto;background:#fff;border:1px solid #c8d1dc;border-radius:6px;box-shadow:0 12px 28px rgba(15,23,42,.14);padding:6px}.filter.open .menu{display:grid;gap:2px}.menu label{display:grid;grid-template-columns:18px 1fr;gap:7px;align-items:center;padding:7px 8px;border-radius:5px;font-size:13px}.menu label:hover{background:#f0f5f8}.action-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:8px 0}.action-row button,.reset-all-row button{height:38px}.fund-list{min-height:260px;max-height:calc(100vh - 292px);overflow:auto;border:1px solid #c8d1dc;border-radius:6px;background:#fff;padding:6px}.fund-option{display:grid;grid-template-columns:18px 1fr;gap:8px;padding:7px 8px;border-radius:5px;font-size:13px;font-weight:750;cursor:pointer}.fund-option:hover{background:#f0f5f8}.fund-meta{display:block;margin-top:2px;color:var(--muted);font-size:11px;font-weight:600}.period{padding:12px 14px;display:grid;grid-template-columns:minmax(220px,1fr) minmax(220px,1fr);gap:10px;align-items:end}.date-card{display:grid;gap:6px}.label-row{display:flex;gap:6px;align-items:center;color:#314052;font-size:12px;font-weight:750}.date-card input{height:38px;border:1px solid #c8d1dc;border-radius:6px;padding:0 10px;font-size:14px;font-weight:700}.quick{display:flex;gap:6px}.quick button{height:26px;padding:0 8px;font-size:12px}.metrics{display:grid;grid-template-columns:repeat(6,minmax(140px,1fr));overflow:hidden}.metric{padding:15px 16px;border-right:1px solid var(--line);min-height:86px}.metric:last-child{border-right:0}.metric span{display:block;color:var(--muted);font-size:12px;font-weight:700;margin-bottom:9px}.metric strong{font-size:22px;white-space:nowrap}.chart-panel{padding:16px}.panel-title{display:flex;justify-content:space-between;gap:12px;align-items:baseline;margin-bottom:10px}.title-note{color:var(--muted);font-size:11px}.chart-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.chart-actions button,.table-actions button,.legend-clear{height:26px;padding:0 9px;font-size:12px}h2{margin:0;font-size:17px}.title-with-note{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}#chart{height:468px;background:#fbfcfe;border:1px solid #e3e8ee;border-radius:6px}.chart-panel.collapsed #chart,.chart-panel.collapsed .legend,.chart-panel.collapsed .legend-head{display:none}.legend-head{display:flex;justify-content:flex-end;margin-top:10px}.legend{display:flex;flex-wrap:wrap;justify-content:center;gap:8px 14px;margin-top:8px}.legend button{display:inline-flex;gap:6px;align-items:center;border:1px solid transparent;border-radius:6px;background:transparent;padding:3px 6px;font-size:12px;font-weight:700;cursor:pointer}.legend button.active{background:#e8f3f1;border-color:var(--accent)}.legend button.dim{opacity:.28}.swatch{width:20px;height:3px;border-radius:2px}.table-panel{overflow:hidden}.table-head{display:flex;justify-content:space-between;align-items:baseline;padding:14px 16px;border-bottom:1px solid var(--line)}.table-wrap{max-height:430px;overflow:auto}.table-panel.expanded{position:relative;z-index:4;grid-column:1/-1}.table-panel.expanded .table-wrap{height:calc(100vh - 180px);min-height:760px;max-height:none!important}table{width:100%;border-collapse:collapse;background:#fff;font-size:13px}th,td{padding:9px 10px;border-bottom:1px solid #edf1f5;text-align:right;white-space:nowrap}th{position:sticky;top:0;background:#eef3f7;color:#314052;font-weight:800;cursor:pointer}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2),th:nth-child(3),td:nth-child(3){text-align:left}.pos{color:var(--good);font-weight:750}.neg{color:var(--bad);font-weight:750}.empty{height:100%;min-height:320px;display:flex;align-items:center;justify-content:center;color:#5b6b82;font-size:16px}.hidden{display:none}@media(max-width:900px){.shell{grid-template-columns:1fr}.period{grid-template-columns:1fr}.metrics{grid-template-columns:1fr 1fr}.sidebar{position:relative;max-height:none}.fund-list{max-height:420px}}
+.bm-groups{display:grid;grid-template-columns:1fr;gap:6px;padding-bottom:10px;border-bottom:1px solid var(--line)}.bm-group{border:1px solid #d8e0e8;border-radius:6px;background:#fff;overflow:hidden}.bm-group-head{width:100%;height:32px;border:0;background:#fff;display:flex;justify-content:space-between;align-items:center;padding:0 9px;color:var(--ink);font-size:13px;font-weight:800;cursor:pointer}.bm-group-head:hover{background:#f0f5f8}.bm-count{color:var(--muted);font-size:11px;font-weight:750}.bm-items{display:none;padding:5px 6px 7px;border-top:1px solid #edf1f5}.bm-group.open .bm-items{display:grid;gap:4px}.bm-option{display:grid;grid-template-columns:18px 1fr;gap:6px;align-items:start;padding:5px 4px;border-radius:5px;font-size:12px;font-weight:800;cursor:pointer}.bm-option:hover{background:#f0f5f8}.bm-desc{display:block;margin-top:2px;color:var(--muted);font-size:10.5px;font-weight:600;line-height:1.25}
 </style>
 <script>%%PLOTLY%%</script>
 </head>
 <body>
 <header><h1>펀드 일별 수익률 대시보드</h1><div class="source">원본: %%SOURCE%% · 데이터 %%ROWS%%건 · 펀드 %%FUNDS%%개 · 기간 %%MIN%% ~ %%MAX%% · 생성 %%GEN%%</div></header>
-<main><div class="shell"><aside class="panel sidebar"><h3 class="side-title">BM 선택</h3><div id="bmBox" class="bm-grid"></div><div class="reset-all-row"><button id="resetAll">전체 초기화</button></div><h3 class=\"side-title\" style=\"margin-top:12px\">팀별 선택</h3><div id="teamButtons" class="team-actions"></div><h3 class="side-title">펀드 선택</h3><div class="filter-grid"><div class="filter" id="typeFilter"><div class="label-row">펀드 유형</div><button type="button" id="typeBtn">전체</button><div class="menu" id="typeMenu"></div></div><div class="filter" id="mgrFilter"><div class="label-row">운용사</div><button type="button" id="mgrBtn">전체</button><div class="menu" id="mgrMenu"></div></div></div><div class="action-row"><button id="selectBtn">일괄 선택</button><button id="clearBtn">일괄 해제</button></div><div id="fundBox" class="fund-list"></div></aside>
+<main><div class="shell"><aside class="panel sidebar"><h3 class="side-title">BM 선택</h3><div id="bmBox" class="bm-groups"></div><div class="reset-all-row"><button id="resetAll">전체 초기화</button></div><h3 class=\"side-title\" style=\"margin-top:12px\">팀별 선택</h3><div id="teamButtons" class="team-actions"></div><h3 class="side-title">펀드 선택</h3><div class="filter-grid"><div class="filter" id="typeFilter"><div class="label-row">펀드 유형</div><button type="button" id="typeBtn">전체</button><div class="menu" id="typeMenu"></div></div><div class="filter" id="mgrFilter"><div class="label-row">운용사</div><button type="button" id="mgrBtn">전체</button><div class="menu" id="mgrMenu"></div></div></div><div class="action-row"><button id="selectBtn">일괄 선택</button><button id="clearBtn">일괄 해제</button></div><div id="fundBox" class="fund-list"></div></aside>
 <div class="main"><section class="panel period"><div class="date-card"><div class="label-row"><span>시작일</span><span class="quick"><button id="ytd">연초</button><button id="mtd">월초</button></span></div><input type="date" id="start"></div><div class="date-card"><div class="label-row"><span>종료일</span><span class="quick"><button id="allPeriod">기간 전체</button></span></div><input type="date" id="end"></div></section><section class="panel metrics" id="metrics"></section><section class="panel chart-panel" id="chartPanel"><div class="panel-title"><div class="title-with-note"><h2>누적수익률 비교 추이</h2><span class="title-note">하단의 범례를 클릭하면 펀드가 강조됩니다</span></div><div class="chart-actions"><button id="toggleChart">차트 접기</button><button id="colors">색상 변경</button><button id="labels">레이블 숨김</button><span class="title-note" id="chartHint"></span></div></div><div id="chart"></div><div class="legend-head"><button id="clearHighlightBtn" class="legend-clear">강조해제</button></div><div id="legend" class="legend"></div></section><section class="panel table-panel" id="perfPanel"><div class="table-head"><div><h2>성과지표 <span class="title-note">(펀드 기준가로 계산한 성과로, 실제 집행금액 기준 성과와 일부 차이가 발생할 수 있습니다)</span></h2><div class="title-note" id="perfHint"></div></div><div class="table-actions"><button id="expandTable">확대</button><button id="downloadExcel">엑셀 다운</button></div></div><div class="table-wrap"><table><thead><tr id="perfHead"></tr></thead><tbody id="perfBody"></tbody></table></div></section><details class="panel table-panel"><summary class="table-head"><div><h2>미등록 펀드</h2><div class="title-note" id="unmappedHint"></div></div></summary><div class="table-wrap"><table><thead><tr><th>최근 기준일</th><th>유형</th><th>예탁원펀드코드</th><th>투자일</th><th>펀드명</th><th>일수익률</th><th>기준가</th><th>누적수익률</th><th>관측치</th></tr></thead><tbody id="unmappedBody"></tbody></table></div></details></div></div></main>
 <script>
 const DATA=%%DATA%%;
 const typeOrder=['주식형','혼합형','메자닌','멀티','롱숏','공모주','EMP','Pre-IPO','채권형(원화)','채권형(외화)','기타'];
 const teamOrder=['주식','주식(메자닌)','채권(원화/단독)','채권(원화/수인)','채권(외화/SB)','채권(외화/복합)','글로벌'];
 const colorPalettes=[['#2563eb','#dc2626','#059669','#d97706','#7c3aed','#0891b2','#be185d','#4d7c0f','#9333ea','#b45309','#0f766e','#e11d48'],['#111827','#f97316','#14b8a6','#c026d3','#84cc16','#ef4444','#0284c7','#a16207','#16a34a','#db2777','#4338ca','#65a30d'],['#0f766e','#e11d48','#1d4ed8','#ca8a04','#9333ea','#15803d','#ea580c','#0e7490','#be123c','#4f46e5','#854d0e','#047857']];
-let selected=new Set(),selectedBm=new Set(),selectedTypes=new Set(),selectedManagers=new Set(),selectedTeams=new Set(),highlighted=new Set(),palette=0,showLabels=true,sortKey='periodReturn',sortDir='desc',currentModels=[];
+let selected=new Set(),selectedBm=new Set(),selectedTypes=new Set(),selectedManagers=new Set(),selectedTeams=new Set(),openBmCategories=new Set(),highlighted=new Set(),palette=0,showLabels=true,sortKey='periodReturn',sortDir='desc',currentModels=[];
 const $=id=>document.getElementById(id);
 const cols=[['name','펀드명'],['type','유형'],['investDate','투자일'],['periodReturn','기간수익률'],['annualReturn','연환산 수익률'],['vol','연환산 변동성'],['sharpe','Sharpe'],['mdd','MDD'],['ytd','YTD'],['mtd','MTD'],['d1','1일'],['w1','1주'],['m1','1개월'],['m3','3개월'],['m6','6개월'],['y1','1년']];
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
@@ -250,6 +374,8 @@ function setAllFilters(){selectedTypes=new Set([...new Set(DATA.funds.map(f=>f.t
 function resetFilterSelections(){selectedTypes.clear();selectedManagers.clear()}
 function optionList(values,set,menu,btn){const visible=new Set([...set].filter(v=>values.includes(v)));const all=values.length>0&&visible.size===values.length;menu.innerHTML=`<label><input type="checkbox" data-all="1" ${all?'checked':''}>전체</label>`+values.map(v=>`<label><input type="checkbox" value="${esc(v)}" ${(all||visible.has(v))?'checked':''}>${esc(v)}</label>`).join('');btn.textContent=all?'전체':visible.size?`${visible.size}개 선택`:'선택 없음';menu.querySelectorAll('input').forEach(input=>input.onchange=()=>{if(input.dataset.all){if(all)values.forEach(v=>set.delete(v));else values.forEach(v=>set.add(v))}else{input.checked?set.add(input.value):set.delete(input.value)}renderFilters();renderFunds();render()})}
 function renderFilters(){const base=baseByTeam();const types=[...new Set(base.map(f=>f.type))].sort((a,b)=>(typeOrder.indexOf(a)<0?99:typeOrder.indexOf(a))-(typeOrder.indexOf(b)<0?99:typeOrder.indexOf(b))||a.localeCompare(b,'ko-KR'));const mgrBase=base.filter(f=>!selectedTypes.size||selectedTypes.has(f.type));const managers=[...new Set(mgrBase.map(f=>f.manager))].sort((a,b)=>a.localeCompare(b,'ko-KR'));optionList(types,selectedTypes,$('typeMenu'),$('typeBtn'));optionList(managers,selectedManagers,$('mgrMenu'),$('mgrBtn'))}
+function bmGroups(){const map=new Map();DATA.bms.forEach(b=>{const category=b.category||'BM';if(!map.has(category))map.set(category,[]);map.get(category).push(b)});return[...map.entries()]}
+function renderBmBox(){const groups=bmGroups();$('bmBox').innerHTML=groups.map(([category,items])=>{const open=openBmCategories.has(category),picked=items.filter(b=>selectedBm.has(String(b.id))).length;return`<div class="bm-group${open?' open':''}"><button type="button" class="bm-group-head" data-category="${esc(category)}"><span>${esc(category)}</span><span class="bm-count">${picked}/${items.length}</span></button><div class="bm-items">${items.map(b=>`<label class="bm-option"><input type="checkbox" value="${esc(b.id)}" ${selectedBm.has(String(b.id))?'checked':''}><span>${esc(b.name)}${b.description?`<span class="bm-desc">${esc(b.description)}</span>`:''}</span></label>`).join('')}</div></div>`}).join('');$('bmBox').querySelectorAll('.bm-group-head').forEach(button=>button.onclick=()=>{const category=button.dataset.category;openBmCategories.has(category)?openBmCategories.delete(category):openBmCategories.add(category);renderBmBox()});$('bmBox').querySelectorAll('input').forEach(input=>input.onchange=()=>{input.checked?selectedBm.add(input.value):selectedBm.delete(input.value);renderBmBox();render()})}
 function renderTeamButtons(){const teams=teamValues();$('teamButtons').innerHTML=teams.map(team=>`<button type="button" class="team-btn${selectedTeams.has(team)?' active':''}" data-team="${esc(team)}" title="${esc(team)}">${esc(team)}</button>`).join('');$('teamButtons').querySelectorAll('button').forEach(button=>button.onclick=()=>{const team=button.dataset.team;selectedTeams.has(team)?selectedTeams.delete(team):selectedTeams.add(team);resetFilterSelections();renderTeamButtons();renderFilters();renderFunds();render()})}
 function renderFunds(){$('fundBox').innerHTML=filteredFunds().map(f=>`<label class="fund-option"><input type="checkbox" value="${f.id}" ${selected.has(String(f.id))?'checked':''}><span>${esc(f.name)}<span class="fund-meta">${esc([f.type,f.manager,f.team,f.code].filter(Boolean).join(' · '))}</span></span></label>`).join('');$('fundBox').querySelectorAll('input').forEach(input=>input.onchange=()=>{input.checked?selected.add(input.value):selected.delete(input.value);render()})}
 function selectedItems(){return[...DATA.funds.filter(f=>selected.has(String(f.id))),...DATA.bms.filter(b=>selectedBm.has(String(b.id)))]}
@@ -264,8 +390,8 @@ function renderPerformance(){renderPerfHead();let ms=perfModels();$('perfHint').
 function xmlEscape(v){return String(v??'').replace(/[<>&"']/g,ch=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&apos;'}[ch]))}function excelXml(sheet,header,rows){const trs=[header,...rows].map(row=>`<Row>${row.map(v=>`<Cell><Data ss:Type="String">${xmlEscape(v)}</Data></Cell>`).join('')}</Row>`).join('');return`<?xml version="1.0" encoding="UTF-8"?><?mso-application progid="Excel.Sheet"?><Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"><Worksheet ss:Name="${xmlEscape(sheet)}"><Table>${trs}</Table></Worksheet></Workbook>`}
 function downloadExcel(){const header=cols.map(c=>c[1]);const rows=[...document.querySelectorAll('#perfBody tr')].map(tr=>[...tr.children].map(td=>td.textContent));const blob=new Blob(['\ufeff'+excelXml('성과지표',header,rows)],{type:'application/vnd.ms-excel;charset=utf-8'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='performance_metrics.xls';a.click();URL.revokeObjectURL(a.href)}
 function renderUnmapped(){const rows=DATA.unmappedFunds||[];$('unmappedHint').textContent=rows.length?`${rows.length.toLocaleString('ko-KR')}개 · mapping.xlsx 미등록`:'미등록 펀드 없음';$('unmappedBody').innerHTML=rows.length?rows.map(x=>`<tr><td>${esc(x.latestDate||'')}</td><td>${esc(x.type||'')}</td><td>${esc(x.code||'')}</td><td>${esc(x.investDate||'')}</td><td>${esc(x.name||'')}</td><td class="${cls(x.dailyReturn)}">${fmtPoint(x.dailyReturn)}</td><td>${fmtNum(x.nav)}</td><td class="${cls(x.cumulativeReturn)}">${fmtPoint(x.cumulativeReturn)}</td><td>${(x.count||0).toLocaleString('ko-KR')}</td></tr>`).join(''):`<tr><td colspan="9" class="empty">mapping.xlsx에 미등록된 펀드가 없습니다.</td></tr>`}
-function resetAll(){selected.clear();selectedBm.clear();selectedTeams.clear();highlighted.clear();palette=0;showLabels=true;sortKey='periodReturn';sortDir='desc';$('start').value=DATA.dateMin;$('end').value=DATA.dateMax;$('labels').textContent='레이블 숨김';$('chartPanel').classList.remove('collapsed');$('toggleChart').textContent='차트 접기';setAllFilters();renderTeamButtons();renderFilters();renderFunds();$('bmBox').querySelectorAll('input').forEach(i=>i.checked=false);render()}
-function init(){setAllFilters();$('start').value=DATA.dateMin;$('end').value=DATA.dateMax;$('start').min=DATA.dateMin;$('end').max=DATA.dateMax;$('bmBox').innerHTML=DATA.bms.map(b=>`<label><input type="checkbox" value="${b.id}">${esc(b.name)}</label>`).join('');$('bmBox').querySelectorAll('input').forEach(i=>i.onchange=()=>{i.checked?selectedBm.add(i.value):selectedBm.delete(i.value);render()});['typeFilter','mgrFilter'].forEach(id=>$(id).querySelector('button').onclick=()=>$(id).classList.toggle('open'));document.addEventListener('click',e=>{if(!e.target.closest('.filter'))document.querySelectorAll('.filter').forEach(f=>f.classList.remove('open'))});$('selectBtn').onclick=()=>{filteredFunds().forEach(f=>selected.add(String(f.id)));renderFunds();render()};$('clearBtn').onclick=()=>{filteredFunds().forEach(f=>selected.delete(String(f.id)));renderFunds();render()};$('resetAll').onclick=resetAll;$('ytd').onclick=()=>{const y=$('end').value.slice(0,4),raw=`${y}-01-01`,target=raw<DATA.dateMin?DATA.dateMin:raw;$('start').value=firstDateOnOrAfter(target,$('end').value);render()};$('mtd').onclick=()=>{const raw=$('end').value.slice(0,8)+'01',target=raw<DATA.dateMin?DATA.dateMin:raw;$('start').value=firstDateOnOrAfter(target,$('end').value);render()};$('allPeriod').onclick=()=>{$('start').value=DATA.dateMin;$('end').value=DATA.dateMax;render()};$('labels').onclick=()=>{showLabels=!showLabels;$('labels').textContent=showLabels?'레이블 숨김':'레이블 표시';render()};$('colors').onclick=()=>{palette=(palette+1)%colorPalettes.length;render()};$('toggleChart').onclick=()=>{$('chartPanel').classList.toggle('collapsed');$('toggleChart').textContent=$('chartPanel').classList.contains('collapsed')?'차트 열기':'차트 접기'};$('clearHighlightBtn').onclick=()=>{highlighted.clear();renderChart()};$('start').onchange=render;$('end').onchange=render;$('expandTable').onclick=()=>{$('perfPanel').classList.toggle('expanded');$('expandTable').textContent=$('perfPanel').classList.contains('expanded')?'축소':'확대'};$('downloadExcel').onclick=downloadExcel;renderPerfHead();renderTeamButtons();renderFilters();renderFunds();renderUnmapped();render()}
+function resetAll(){selected.clear();selectedBm.clear();selectedTeams.clear();openBmCategories.clear();highlighted.clear();palette=0;showLabels=true;sortKey='periodReturn';sortDir='desc';$('start').value=DATA.dateMin;$('end').value=DATA.dateMax;$('labels').textContent='레이블 숨김';$('chartPanel').classList.remove('collapsed');$('toggleChart').textContent='차트 접기';setAllFilters();renderBmBox();renderTeamButtons();renderFilters();renderFunds();render()}
+function init(){setAllFilters();$('start').value=DATA.dateMin;$('end').value=DATA.dateMax;$('start').min=DATA.dateMin;$('end').max=DATA.dateMax;renderBmBox();['typeFilter','mgrFilter'].forEach(id=>$(id).querySelector('button').onclick=()=>$(id).classList.toggle('open'));document.addEventListener('click',e=>{if(!e.target.closest('.filter'))document.querySelectorAll('.filter').forEach(f=>f.classList.remove('open'))});$('selectBtn').onclick=()=>{filteredFunds().forEach(f=>selected.add(String(f.id)));renderFunds();render()};$('clearBtn').onclick=()=>{filteredFunds().forEach(f=>selected.delete(String(f.id)));renderFunds();render()};$('resetAll').onclick=resetAll;$('ytd').onclick=()=>{const y=$('end').value.slice(0,4),raw=`${y}-01-01`,target=raw<DATA.dateMin?DATA.dateMin:raw;$('start').value=firstDateOnOrAfter(target,$('end').value);render()};$('mtd').onclick=()=>{const raw=$('end').value.slice(0,8)+'01',target=raw<DATA.dateMin?DATA.dateMin:raw;$('start').value=firstDateOnOrAfter(target,$('end').value);render()};$('allPeriod').onclick=()=>{$('start').value=DATA.dateMin;$('end').value=DATA.dateMax;render()};$('labels').onclick=()=>{showLabels=!showLabels;$('labels').textContent=showLabels?'레이블 숨김':'레이블 표시';render()};$('colors').onclick=()=>{palette=(palette+1)%colorPalettes.length;render()};$('toggleChart').onclick=()=>{$('chartPanel').classList.toggle('collapsed');$('toggleChart').textContent=$('chartPanel').classList.contains('collapsed')?'차트 열기':'차트 접기'};$('clearHighlightBtn').onclick=()=>{highlighted.clear();renderChart()};$('start').onchange=render;$('end').onchange=render;$('expandTable').onclick=()=>{$('perfPanel').classList.toggle('expanded');$('expandTable').textContent=$('perfPanel').classList.contains('expanded')?'축소':'확대'};$('downloadExcel').onclick=downloadExcel;renderPerfHead();renderTeamButtons();renderFilters();renderFunds();renderUnmapped();render()}
 function startAutoRefreshCheck(){if(!/^https?:/.test(location.protocol))return;const current=DATA.generatedAt;const check=()=>fetch(location.href.split('#')[0]+(location.href.includes('?')?'&':'?')+'_='+Date.now(),{cache:'no-store'}).then(r=>r.ok?r.text():'').then(t=>{const m='"generatedAt":"',i=t.indexOf(m);if(i<0)return;const latest=t.slice(i+m.length).split('"')[0];if(latest&&latest!==current)location.reload()}).catch(()=>{});setInterval(check,300000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)check()})}
 init();startAutoRefreshCheck();
 </script>
