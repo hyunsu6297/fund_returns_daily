@@ -1,5 +1,6 @@
 import csv
 import json
+import re
 from collections import OrderedDict
 from datetime import date, datetime
 from pathlib import Path
@@ -9,6 +10,7 @@ import openpyxl
 
 BASE_DIR = Path(__file__).resolve().parent
 SOURCE = BASE_DIR / "펀드 기준가.xlsx"
+DEFAULT_START_DATE = "2025-01-01"
 BM_WORKBOOK = BASE_DIR / "bm.xlsx"
 BM_DEFINITION = BASE_DIR / "bm_definition_template.xlsx"
 MAPPING = BASE_DIR / "mapping.xlsx"
@@ -47,6 +49,18 @@ def mapping_rows():
         with MAPPING_CSV.open("r", encoding="utf-8-sig", newline="") as file:
             return list(csv.reader(file))
     raise FileNotFoundError("mapping.xlsx 또는 mapping.csv가 필요합니다.")
+
+
+def fund_source_files():
+    files = [path for path in BASE_DIR.glob("펀드 기준가*.xlsx") if not path.name.startswith("~$")]
+    if not files:
+        raise FileNotFoundError("펀드 기준가.xlsx 파일이 필요합니다.")
+
+    def sort_key(path):
+        match = re.search(r"\((\d{2})년\)", path.name)
+        return (int(match.group(1)) if match else 99, path.name)
+
+    return sorted(files, key=sort_key)
 
 
 def load_mapping():
@@ -259,41 +273,43 @@ def build_bm_series():
 
 def build_payload():
     mapping = load_mapping()
-    workbook = openpyxl.load_workbook(SOURCE, read_only=True, data_only=True)
-    sheet = workbook["Data"] if "Data" in workbook.sheetnames else workbook.active
+    source_files = fund_source_files()
     funds = OrderedDict()
     series = {}
     all_dates = []
     unmapped = {}
 
-    for row in sheet.iter_rows(min_row=4, values_only=True):
-        base_date = as_date_text(row[1])
-        if not base_date:
-            continue
-        code = str(row[3]).strip() if row[3] is not None else ""
-        info = mapping.get(code)
-        if code and not info:
-            item = unmapped.setdefault(code, {"latestDate": "", "type": "", "code": code, "investDate": "", "name": "", "dailyReturn": None, "nav": None, "cumulativeReturn": None, "count": 0})
-            if base_date >= item["latestDate"]:
-                item.update({
-                    "latestDate": base_date,
-                    "type": str(row[2]).strip() if row[2] is not None else "",
-                    "investDate": as_date_text(row[4]),
-                    "name": str(row[5]).strip() if row[5] is not None else "",
-                    "dailyReturn": as_number(row[6]),
-                    "nav": as_number(row[7]),
-                    "cumulativeReturn": as_number(row[10]),
-                })
-            item["count"] += 1
-        if not info:
-            continue
-        if code not in funds:
-            funds[code] = len(funds)
-            series[str(funds[code])] = []
-        cum = as_number(row[10])
-        level = round(cum * 10 + 1000, 6) if cum is not None else None
-        series[str(funds[code])].append([base_date, as_number(row[6]), as_number(row[7]), as_number(row[8]), as_number(row[9]), cum, level])
-        all_dates.append(base_date)
+    for source_file in source_files:
+        workbook = openpyxl.load_workbook(source_file, read_only=True, data_only=True)
+        sheet = workbook["Data"] if "Data" in workbook.sheetnames else workbook.active
+        for row in sheet.iter_rows(min_row=4, values_only=True):
+            base_date = as_date_text(row[1])
+            if not base_date:
+                continue
+            code = str(row[3]).strip() if row[3] is not None else ""
+            info = mapping.get(code)
+            if code and not info:
+                item = unmapped.setdefault(code, {"latestDate": "", "type": "", "code": code, "investDate": "", "name": "", "dailyReturn": None, "nav": None, "cumulativeReturn": None, "count": 0})
+                if base_date >= item["latestDate"]:
+                    item.update({
+                        "latestDate": base_date,
+                        "type": str(row[2]).strip() if row[2] is not None else "",
+                        "investDate": as_date_text(row[4]),
+                        "name": str(row[5]).strip() if row[5] is not None else "",
+                        "dailyReturn": as_number(row[6]),
+                        "nav": as_number(row[7]),
+                        "cumulativeReturn": as_number(row[10]),
+                    })
+                item["count"] += 1
+            if not info:
+                continue
+            if code not in funds:
+                funds[code] = len(funds)
+                series[str(funds[code])] = []
+            cum = as_number(row[10])
+            level = round(cum * 10 + 1000, 6) if cum is not None else None
+            series[str(funds[code])].append([base_date, as_number(row[6]), as_number(row[7]), as_number(row[8]), as_number(row[9]), cum, level])
+            all_dates.append(base_date)
 
     append_hana_emp(mapping, funds, series, all_dates)
 
@@ -316,7 +332,8 @@ def build_payload():
     if not all_dates:
         all_dates = [date for rows in sorted_series.values() for date, *_ in rows]
     return {
-        "sourceFile": SOURCE.name,
+        "sourceFile": ", ".join(path.name for path in source_files),
+        "defaultStart": DEFAULT_START_DATE,
         "generatedAt": datetime.now(KST).strftime("%Y-%m-%d %H:%M"),
         "dateMin": min(all_dates),
         "dateMax": max(all_dates),
@@ -350,7 +367,7 @@ def build_html(payload):
 <body>
 <header><h1>펀드 일별 수익률 대시보드</h1><div class="source">원본: %%SOURCE%% · 데이터 %%ROWS%%건 · 펀드 %%FUNDS%%개 · 기간 %%MIN%% ~ %%MAX%% · 생성 %%GEN%%</div></header>
 <main><div class="shell"><aside class="panel sidebar"><h3 class="side-title">BM 선택</h3><div id="bmBox" class="bm-groups"></div><div class="reset-all-row"><button id="resetAll">전체 초기화</button></div><h3 class=\"side-title\" style=\"margin-top:12px\">팀별 선택</h3><div id="teamButtons" class="team-actions"></div><h3 class="side-title">펀드 선택</h3><div class="filter-grid"><div class="filter" id="typeFilter"><div class="label-row">펀드 유형</div><button type="button" id="typeBtn">전체</button><div class="menu" id="typeMenu"></div></div><div class="filter" id="mgrFilter"><div class="label-row">운용사</div><button type="button" id="mgrBtn">전체</button><div class="menu" id="mgrMenu"></div></div></div><div class="action-row"><button id="selectBtn">일괄 선택</button><button id="clearBtn">일괄 해제</button></div><div id="fundBox" class="fund-list"></div></aside>
-<div class="main"><section class="panel period"><div class="date-card"><div class="label-row"><span>시작일</span><span class="quick"><button id="ytd">연초</button><button id="mtd">월초</button></span></div><input type="date" id="start"></div><div class="date-card"><div class="label-row"><span>종료일</span><span class="quick"><button id="allPeriod">기간 전체</button></span></div><input type="date" id="end"></div></section><section class="panel metrics" id="metrics"></section><section class="panel chart-panel" id="chartPanel"><div class="panel-title"><div class="title-with-note"><h2>누적수익률 비교 추이</h2><span class="title-note">하단의 범례를 클릭하면 펀드가 강조됩니다</span></div><div class="chart-actions"><button id="toggleChart">차트 접기</button><button id="colors">색상 변경</button><button id="labels">레이블 숨김</button><span class="title-note" id="chartHint"></span></div></div><div id="chart"></div><div class="legend-head"><button id="clearHighlightBtn" class="legend-clear">강조해제</button></div><div id="legend" class="legend"></div></section><section class="panel table-panel" id="perfPanel"><div class="table-head"><div><h2>성과지표 <span class="title-note">(펀드 기준가로 계산한 성과로, 실제 집행금액 기준 성과와 일부 차이가 발생할 수 있습니다)</span></h2><div class="title-note" id="perfHint"></div></div><div class="table-actions"><button id="expandTable">확대</button><button id="downloadExcel">엑셀 다운</button></div></div><div class="table-wrap"><table><thead><tr id="perfHead"></tr></thead><tbody id="perfBody"></tbody></table></div></section><details class="panel table-panel"><summary class="table-head"><div><h2>미등록 펀드</h2><div class="title-note" id="unmappedHint"></div></div></summary><div class="table-wrap"><table><thead><tr><th>최근 기준일</th><th>유형</th><th>예탁원펀드코드</th><th>투자일</th><th>펀드명</th><th>일수익률</th><th>기준가</th><th>누적수익률</th><th>관측치</th></tr></thead><tbody id="unmappedBody"></tbody></table></div></details></div></div></main>
+<div class="main"><section class="panel period"><div class="date-card"><div class="label-row"><span>시작일</span><span class="quick"><button id="ytd">연초</button><button id="mtd">월초</button><button id="y2023">23년 이후</button><button id="y2024">24년 이후</button><button id="y2025">25년 이후</button></span></div><input type="date" id="start"></div><div class="date-card"><div class="label-row"><span>종료일</span><span class="quick"><button id="allPeriod">기간 전체</button></span></div><input type="date" id="end"></div></section><section class="panel metrics" id="metrics"></section><section class="panel chart-panel" id="chartPanel"><div class="panel-title"><div class="title-with-note"><h2>누적수익률 비교 추이</h2><span class="title-note">하단의 범례를 클릭하면 펀드가 강조됩니다</span></div><div class="chart-actions"><button id="toggleChart">차트 접기</button><button id="colors">색상 변경</button><button id="labels">레이블 숨김</button><span class="title-note" id="chartHint"></span></div></div><div id="chart"></div><div class="legend-head"><button id="clearHighlightBtn" class="legend-clear">강조해제</button></div><div id="legend" class="legend"></div></section><section class="panel table-panel" id="perfPanel"><div class="table-head"><div><h2>성과지표 <span class="title-note">(펀드 기준가로 계산한 성과로, 실제 집행금액 기준 성과와 일부 차이가 발생할 수 있습니다)</span></h2><div class="title-note" id="perfHint"></div></div><div class="table-actions"><button id="expandTable">확대</button><button id="downloadExcel">엑셀 다운</button></div></div><div class="table-wrap"><table><thead><tr id="perfHead"></tr></thead><tbody id="perfBody"></tbody></table></div></section><details class="panel table-panel"><summary class="table-head"><div><h2>미등록 펀드</h2><div class="title-note" id="unmappedHint"></div></div></summary><div class="table-wrap"><table><thead><tr><th>최근 기준일</th><th>유형</th><th>예탁원펀드코드</th><th>투자일</th><th>펀드명</th><th>일수익률</th><th>기준가</th><th>누적수익률</th><th>관측치</th></tr></thead><tbody id="unmappedBody"></tbody></table></div></details></div></div></main>
 <script>
 const DATA=%%DATA%%;
 const typeOrder=['주식형','혼합형','메자닌','멀티','롱숏','공모주','EMP','Pre-IPO','채권형(원화)','채권형(외화)','기타'];
@@ -362,6 +379,8 @@ const cols=[['name','펀드명'],['type','유형'],['investDate','투자일'],['
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function fmtPct(v){return v==null||Number.isNaN(v)?'-':(v*100).toFixed(2)+'%'}function fmtPoint(v){return v==null||Number.isNaN(v)?'-':Number(v).toFixed(2)+'%'}function fmtNum(v,d=2){return v==null||Number.isNaN(v)?'-':Number(v).toLocaleString('ko-KR',{minimumFractionDigits:d,maximumFractionDigits:d})}function cls(v){return v>0?'pos':v<0?'neg':''}
 function allDataDates(){return [...new Set(Object.values(DATA.series).flatMap(rows=>rows.map(row=>row[0])))].filter(Boolean).sort()}function firstDateOnOrAfter(target,end){return allDataDates().find(date=>date>=target&&date<=end)||target}
+function defaultStartDate(){return firstDateOnOrAfter(DATA.defaultStart||'2025-01-01',DATA.dateMax)}
+function setStartYear(year){$('start').value=firstDateOnOrAfter(`${year}-01-01`,$('end').value);render()}
 function dateRange(){let s=$('start').value,e=$('end').value;if(s>e)[s,e]=[e,s];return{start:s,end:e}}
 function rowsFor(id,s=dateRange().start,e=dateRange().end){return(DATA.series[String(id)]||[]).filter(row=>row[0]>=s&&row[0]<=e)}
 function stats(rows,fund){const lr=rows.filter(row=>row[6]!=null);if(lr.length<2)return{};const simple=fund.returnMode==='simple',first=lr[0][6],last=lr.at(-1)[6];const periodReturn=simple?(last-first)/1000:last/first-1;const rets=lr.slice(1).map((row,i)=>simple?(row[6]-lr[i][6])/1000:row[6]/lr[i][6]-1);const avg=rets.reduce((a,b)=>a+b,0)/rets.length;const variance=rets.length>1?rets.reduce((sum,v)=>sum+(v-avg)**2,0)/(rets.length-1):0;const vol=Math.sqrt(variance)*Math.sqrt(252);const annualReturn=simple?periodReturn*252/rets.length:Math.pow(1+periodReturn,252/rets.length)-1;let peak=1,mdd=0;for(const row of lr){const nav=simple?1+(row[6]-first)/1000:row[6]/first;peak=Math.max(peak,nav);mdd=Math.min(mdd,nav/peak-1)}return{observations:lr.length,periodReturn,annualReturn,vol,sharpe:vol?annualReturn/vol:null,mdd}}
@@ -390,8 +409,8 @@ function renderPerformance(){renderPerfHead();let ms=perfModels();$('perfHint').
 function xmlEscape(v){return String(v??'').replace(/[<>&"']/g,ch=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&apos;'}[ch]))}function excelXml(sheet,header,rows){const trs=[header,...rows].map(row=>`<Row>${row.map(v=>`<Cell><Data ss:Type="String">${xmlEscape(v)}</Data></Cell>`).join('')}</Row>`).join('');return`<?xml version="1.0" encoding="UTF-8"?><?mso-application progid="Excel.Sheet"?><Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"><Worksheet ss:Name="${xmlEscape(sheet)}"><Table>${trs}</Table></Worksheet></Workbook>`}
 function downloadExcel(){const header=cols.map(c=>c[1]);const rows=[...document.querySelectorAll('#perfBody tr')].map(tr=>[...tr.children].map(td=>td.textContent));const blob=new Blob(['\ufeff'+excelXml('성과지표',header,rows)],{type:'application/vnd.ms-excel;charset=utf-8'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='performance_metrics.xls';a.click();URL.revokeObjectURL(a.href)}
 function renderUnmapped(){const rows=DATA.unmappedFunds||[];$('unmappedHint').textContent=rows.length?`${rows.length.toLocaleString('ko-KR')}개 · mapping.xlsx 미등록`:'미등록 펀드 없음';$('unmappedBody').innerHTML=rows.length?rows.map(x=>`<tr><td>${esc(x.latestDate||'')}</td><td>${esc(x.type||'')}</td><td>${esc(x.code||'')}</td><td>${esc(x.investDate||'')}</td><td>${esc(x.name||'')}</td><td class="${cls(x.dailyReturn)}">${fmtPoint(x.dailyReturn)}</td><td>${fmtNum(x.nav)}</td><td class="${cls(x.cumulativeReturn)}">${fmtPoint(x.cumulativeReturn)}</td><td>${(x.count||0).toLocaleString('ko-KR')}</td></tr>`).join(''):`<tr><td colspan="9" class="empty">mapping.xlsx에 미등록된 펀드가 없습니다.</td></tr>`}
-function resetAll(){selected.clear();selectedBm.clear();selectedTeams.clear();openBmCategories.clear();highlighted.clear();palette=0;showLabels=true;sortKey='periodReturn';sortDir='desc';$('start').value=DATA.dateMin;$('end').value=DATA.dateMax;$('labels').textContent='레이블 숨김';$('chartPanel').classList.remove('collapsed');$('toggleChart').textContent='차트 접기';setAllFilters();renderBmBox();renderTeamButtons();renderFilters();renderFunds();render()}
-function init(){setAllFilters();$('start').value=DATA.dateMin;$('end').value=DATA.dateMax;$('start').min=DATA.dateMin;$('end').max=DATA.dateMax;renderBmBox();['typeFilter','mgrFilter'].forEach(id=>$(id).querySelector('button').onclick=()=>$(id).classList.toggle('open'));document.addEventListener('click',e=>{if(!e.target.closest('.filter'))document.querySelectorAll('.filter').forEach(f=>f.classList.remove('open'))});$('selectBtn').onclick=()=>{filteredFunds().forEach(f=>selected.add(String(f.id)));renderFunds();render()};$('clearBtn').onclick=()=>{filteredFunds().forEach(f=>selected.delete(String(f.id)));renderFunds();render()};$('resetAll').onclick=resetAll;$('ytd').onclick=()=>{const y=$('end').value.slice(0,4),raw=`${y}-01-01`,target=raw<DATA.dateMin?DATA.dateMin:raw;$('start').value=firstDateOnOrAfter(target,$('end').value);render()};$('mtd').onclick=()=>{const raw=$('end').value.slice(0,8)+'01',target=raw<DATA.dateMin?DATA.dateMin:raw;$('start').value=firstDateOnOrAfter(target,$('end').value);render()};$('allPeriod').onclick=()=>{$('start').value=DATA.dateMin;$('end').value=DATA.dateMax;render()};$('labels').onclick=()=>{showLabels=!showLabels;$('labels').textContent=showLabels?'레이블 숨김':'레이블 표시';render()};$('colors').onclick=()=>{palette=(palette+1)%colorPalettes.length;render()};$('toggleChart').onclick=()=>{$('chartPanel').classList.toggle('collapsed');$('toggleChart').textContent=$('chartPanel').classList.contains('collapsed')?'차트 열기':'차트 접기'};$('clearHighlightBtn').onclick=()=>{highlighted.clear();renderChart()};$('start').onchange=render;$('end').onchange=render;$('expandTable').onclick=()=>{$('perfPanel').classList.toggle('expanded');$('expandTable').textContent=$('perfPanel').classList.contains('expanded')?'축소':'확대'};$('downloadExcel').onclick=downloadExcel;renderPerfHead();renderTeamButtons();renderFilters();renderFunds();renderUnmapped();render()}
+function resetAll(){selected.clear();selectedBm.clear();selectedTeams.clear();openBmCategories.clear();highlighted.clear();palette=0;showLabels=true;sortKey='periodReturn';sortDir='desc';$('end').value=DATA.dateMax;$('start').value=defaultStartDate();$('labels').textContent='레이블 숨김';$('chartPanel').classList.remove('collapsed');$('toggleChart').textContent='차트 접기';setAllFilters();renderBmBox();renderTeamButtons();renderFilters();renderFunds();render()}
+function init(){setAllFilters();$('end').value=DATA.dateMax;$('start').value=defaultStartDate();$('start').min=DATA.dateMin;$('end').max=DATA.dateMax;renderBmBox();['typeFilter','mgrFilter'].forEach(id=>$(id).querySelector('button').onclick=()=>$(id).classList.toggle('open'));document.addEventListener('click',e=>{if(!e.target.closest('.filter'))document.querySelectorAll('.filter').forEach(f=>f.classList.remove('open'))});$('selectBtn').onclick=()=>{filteredFunds().forEach(f=>selected.add(String(f.id)));renderFunds();render()};$('clearBtn').onclick=()=>{filteredFunds().forEach(f=>selected.delete(String(f.id)));renderFunds();render()};$('resetAll').onclick=resetAll;$('ytd').onclick=()=>{const y=$('end').value.slice(0,4),raw=`${y}-01-01`,target=raw<DATA.dateMin?DATA.dateMin:raw;$('start').value=firstDateOnOrAfter(target,$('end').value);render()};$('mtd').onclick=()=>{const raw=$('end').value.slice(0,8)+'01',target=raw<DATA.dateMin?DATA.dateMin:raw;$('start').value=firstDateOnOrAfter(target,$('end').value);render()};$('y2023').onclick=()=>setStartYear(2023);$('y2024').onclick=()=>setStartYear(2024);$('y2025').onclick=()=>setStartYear(2025);$('allPeriod').onclick=()=>{$('start').value=DATA.dateMin;$('end').value=DATA.dateMax;render()};$('labels').onclick=()=>{showLabels=!showLabels;$('labels').textContent=showLabels?'레이블 숨김':'레이블 표시';render()};$('colors').onclick=()=>{palette=(palette+1)%colorPalettes.length;render()};$('toggleChart').onclick=()=>{$('chartPanel').classList.toggle('collapsed');$('toggleChart').textContent=$('chartPanel').classList.contains('collapsed')?'차트 열기':'차트 접기'};$('clearHighlightBtn').onclick=()=>{highlighted.clear();renderChart()};$('start').onchange=render;$('end').onchange=render;$('expandTable').onclick=()=>{$('perfPanel').classList.toggle('expanded');$('expandTable').textContent=$('perfPanel').classList.contains('expanded')?'축소':'확대'};$('downloadExcel').onclick=downloadExcel;renderPerfHead();renderTeamButtons();renderFilters();renderFunds();renderUnmapped();render()}
 function startAutoRefreshCheck(){if(!/^https?:/.test(location.protocol))return;const current=DATA.generatedAt;const check=()=>fetch(location.href.split('#')[0]+(location.href.includes('?')?'&':'?')+'_='+Date.now(),{cache:'no-store'}).then(r=>r.ok?r.text():'').then(t=>{const m='"generatedAt":"',i=t.indexOf(m);if(i<0)return;const latest=t.slice(i+m.length).split('"')[0];if(latest&&latest!==current)location.reload()}).catch(()=>{});setInterval(check,300000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)check()})}
 init();startAutoRefreshCheck();
 </script>
