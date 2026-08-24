@@ -1,4 +1,5 @@
 import csv
+import gzip
 import json
 import re
 from collections import OrderedDict
@@ -9,7 +10,7 @@ from zoneinfo import ZoneInfo
 import openpyxl
 
 BASE_DIR = Path(__file__).resolve().parent
-SOURCE = BASE_DIR / "펀드 기준가.xlsx"
+KFR_DATA_DIR = BASE_DIR / "data" / "kfr"
 DEFAULT_START_DATE = "2025-01-01"
 BM_WORKBOOK = BASE_DIR / "bm.xlsx"
 BM_DEFINITION = BASE_DIR / "bm_definition_template.xlsx"
@@ -52,15 +53,29 @@ def mapping_rows():
 
 
 def fund_source_files():
-    files = [path for path in BASE_DIR.glob("펀드 기준가*.xlsx") if not path.name.startswith("~$")]
+    files = list(KFR_DATA_DIR.glob("prices_*.json")) + list(KFR_DATA_DIR.glob("prices_*.json.gz"))
     if not files:
-        raise FileNotFoundError("펀드 기준가.xlsx 파일이 필요합니다.")
+        raise FileNotFoundError(f"KFR prices JSON 파일이 필요합니다: {KFR_DATA_DIR}")
 
     def sort_key(path):
-        match = re.search(r"\((\d{2})년\)", path.name)
-        return (int(match.group(1)) if match else 99, path.name)
+        return (0 if "legacy_history" in path.name else 1, path.name)
 
     return sorted(files, key=sort_key)
+
+
+def price_rows(path):
+    if path.suffix == ".gz":
+        with gzip.open(path, "rt", encoding="utf-8") as stream:
+            payload = json.load(stream)
+    else:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    rows = payload.get("content") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        raise RuntimeError(f"KFR prices JSON content가 배열이 아닙니다: {path}")
+    total = payload.get("total_elements")
+    if isinstance(total, int) and total != len(rows):
+        raise RuntimeError(f"KFR prices JSON 건수 불일치: {path}")
+    return rows
 
 
 def load_mapping():
@@ -280,25 +295,23 @@ def build_payload():
     unmapped = {}
 
     for source_file in source_files:
-        workbook = openpyxl.load_workbook(source_file, read_only=True, data_only=True)
-        sheet = workbook["Data"] if "Data" in workbook.sheetnames else workbook.active
-        for row in sheet.iter_rows(min_row=4, values_only=True):
-            base_date = as_date_text(row[1])
+        for row in price_rows(source_file):
+            base_date = as_date_text(row.get("trade_day"))
             if not base_date:
                 continue
-            code = str(row[3]).strip() if row[3] is not None else ""
+            code = str(row.get("fund_ksd_code") or "").strip()
             info = mapping.get(code)
             if code and not info:
                 item = unmapped.setdefault(code, {"latestDate": "", "type": "", "code": code, "investDate": "", "name": "", "dailyReturn": None, "nav": None, "cumulativeReturn": None, "count": 0})
                 if base_date >= item["latestDate"]:
                     item.update({
                         "latestDate": base_date,
-                        "type": str(row[2]).strip() if row[2] is not None else "",
-                        "investDate": as_date_text(row[4]),
-                        "name": str(row[5]).strip() if row[5] is not None else "",
-                        "dailyReturn": as_number(row[6]),
-                        "nav": as_number(row[7]),
-                        "cumulativeReturn": as_number(row[10]),
+                        "type": str(row.get("composite_name") or "").strip(),
+                        "investDate": as_date_text(row.get("invest_day")),
+                        "name": str(row.get("fund_k_name") or "").strip(),
+                        "dailyReturn": as_number(row.get("ret")),
+                        "nav": as_number(row.get("price")),
+                        "cumulativeReturn": as_number(row.get("cul_ret")),
                     })
                 item["count"] += 1
             if not info:
@@ -306,9 +319,12 @@ def build_payload():
             if code not in funds:
                 funds[code] = len(funds)
                 series[str(funds[code])] = []
-            cum = as_number(row[10])
+            cum = as_number(row.get("cul_ret"))
             level = round(cum * 10 + 1000, 6) if cum is not None else None
-            series[str(funds[code])].append([base_date, as_number(row[6]), as_number(row[7]), as_number(row[8]), as_number(row[9]), cum, level])
+            series[str(funds[code])].append([
+                base_date, as_number(row.get("ret")), as_number(row.get("price")),
+                as_number(row.get("prev_price")), as_number(row.get("share_rate")), cum, level,
+            ])
             all_dates.append(base_date)
 
     append_hana_emp(mapping, funds, series, all_dates)
@@ -316,14 +332,16 @@ def build_payload():
     fund_rows = []
     sorted_series = {}
     for code, old_id in funds.items():
-        rows = sorted(series[str(old_id)], key=lambda item: item[0])
+        by_date = {item[0]: item for item in series[str(old_id)]}
+        rows = [by_date[key] for key in sorted(by_date)]
+        series[str(old_id)] = rows
         fund_rows.append({"id": old_id, **mapping[code], "count": len(rows)})
     fund_rows.sort(key=lambda item: (item["name"], item["code"], item.get("investDate", "")))
     for new_id, fund in enumerate(fund_rows):
         old_id = fund["id"]
         fund = dict(fund)
         fund["id"] = new_id
-        sorted_series[str(new_id)] = sorted(series[str(old_id)], key=lambda item: item[0])
+        sorted_series[str(new_id)] = list(series[str(old_id)])
         fund_rows[new_id] = fund
 
     bms, bm_series = build_bm_series()
